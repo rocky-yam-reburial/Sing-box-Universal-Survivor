@@ -101,25 +101,24 @@ gen_json() {
             ;;
     esac
 
-    cat << 'CFG_HEAD' > "$CFG"
+    cat << 'EOF' > "$CFG"
 {
   "log": {"level": "fatal"},
   "inbounds": [
-CFGHEAD
-sed -i 's/CFGHEAD//' "$CFG"
+EOF
 
     FIRST=1
-    add_inbound() {
+    add_comma() {
         if [ "$FIRST" = "0" ]; then
             printf ",\n" >> "$CFG"
         else
             FIRST=0
         fi
-        cat >> "$CFG"
     }
 
     if [ "$add_basic" = "1" ]; then
-        add_inbound << IN_EOF
+        add_comma
+        cat << EOF >> "$CFG"
     {
       "type": "trojan",
       "tag": "trojan-in",
@@ -138,8 +137,9 @@ sed -i 's/CFGHEAD//' "$CFG"
         }
       }
     }
-IN_EOF
-        add_inbound << IN_EOF
+EOF
+        add_comma
+        cat << EOF >> "$CFG"
     {
       "type": "vless",
       "tag": "vless-in",
@@ -158,8 +158,9 @@ IN_EOF
         }
       }
     }
-IN_EOF
-        add_inbound << IN_EOF
+EOF
+        add_comma
+        cat << EOF >> "$CFG"
     {
       "type": "shadowsocks",
       "tag": "ss-in",
@@ -169,11 +170,12 @@ IN_EOF
       "method": "$SS_M",
       "password": "$SS_P"
     }
-IN_EOF
+EOF
     fi
 
     if [ "$add_tuic" = "1" ]; then
-        add_inbound << IN_EOF
+        add_comma
+        cat << EOF >> "$CFG"
     {
       "type": "tuic",
       "tag": "tuic-in",
@@ -188,11 +190,12 @@ IN_EOF
         "key_path": "$DIR/key.pem"
       }
     }
-IN_EOF
+EOF
     fi
 
     if [ "$add_naive" = "1" ]; then
-        add_inbound << IN_EOF
+        add_comma
+        cat << EOF >> "$CFG"
     {
       "type": "naive",
       "tag": "naive-in",
@@ -206,11 +209,12 @@ IN_EOF
         "key_path": "$DIR/key.pem"
       }
     }
-IN_EOF
+EOF
     fi
 
     if [ "$add_hy2" = "1" ]; then
-        add_inbound << IN_EOF
+        add_comma
+        cat << EOF >> "$CFG"
     {
       "type": "hysteria2",
       "tag": "hy2-in",
@@ -224,10 +228,10 @@ IN_EOF
         "key_path": "$DIR/key.pem"
       }
     }
-IN_EOF
+EOF
     fi
 
-    cat << 'CFG_TAIL' >> "$CFG"
+    cat << 'EOF' >> "$CFG"
   ],
   "outbounds": [{"type": "direct", "tag": "direct"}, {"type": "block", "tag": "block"}],
   "route": {
@@ -237,7 +241,7 @@ IN_EOF
     ]
   }
 }
-CFG_TAIL
+EOF
 }
 
 setup_keeper() {
@@ -574,7 +578,7 @@ while true; do
     echo "  9. 🔄 手动重启并检查核心服务"
     echo "  0. 🚪 退出面板"
     echo "=========================================================="
-    printf "请选择 [0-9]: "
+    printf "请输入选项 [0-9]: "
     read choice
     case "$choice" in
         1) do_install "full" ;;
