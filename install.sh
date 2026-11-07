@@ -1,8 +1,10 @@
 #!/bin/sh
 # ==========================================================
-# Sing-box 面板 v4.2 Pro (全平台兼容 / 极限生存终极版)
+# Sing-box 面板 v4.4 Pro (全平台兼容 / 极限生存终极版)
 # Author: rocky-yam-reburial
+# Repo: Sing-box-Universal-Survivor
 # ==========================================================
+
 if [ "$(id -u)" != "0" ]; then
     echo "[-] 请使用 root 权限运行此脚本"
     exit 1
@@ -11,33 +13,117 @@ fi
 DIR="/etc/sing-box"
 CFG="$DIR/config.json"
 ENV="$DIR/node_info.env"
+BIN="/usr/bin/sing-box"
 
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-else
-    echo "[-] 无法检测系统"
-    exit 1
-fi
+init_env() {
+    mkdir -p "$DIR"
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+    fi
+    case "$ID" in
+        debian|ubuntu)
+            export DEBIAN_FRONTEND=noninteractive
+            CMD="apt-get install -y --no-install-recommends"
+            apt-get update -y >/dev/null 2>&1
+            $CMD wget curl openssl socat git libc6 >/dev/null 2>&1
+            ;;
+        centos|rhel|almalinux|rocky|fedora|amzn)
+            CMD="yum install -y"
+            $CMD wget curl openssl socat git tar gzip >/dev/null 2>&1
+            ;;
+        *)
+            CMD="apk add --no-cache"
+            $CMD wget curl openssl socat git tar gzip libc6-compat gcompat >/dev/null 2>&1
+            ;;
+    esac
+}
 
-case "$ID" in
-    debian|ubuntu)
-        export DEBIAN_FRONTEND=noninteractive
-        CMD="apt-get install -y --no-install-recommends"
-        ;;
-    centos|rhel|almalinux|rocky|fedora|amzn)
-        CMD="yum install -y"
-        ;;
-    *)
-        CMD="apk add --no-cache"
-        $CMD libc6-compat gcompat >/dev/null 2>&1
-        ;;
-esac
+pull_core() {
+    echo "[*] 正在动态探测官方版本库..."
+    init_env
+
+    VER_LATEST=$(curl -sIL -m 5 -o /dev/null -w '%{url_effective}' https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | sed 's#.*/v##' | tr -d '\r\n')
+    [ -z "$VER_LATEST" ] || echo "$VER_LATEST" | grep -q "releases" && VER_LATEST="1.14.2"
+
+    RELS=$(curl -s -m 5 https://api.github.com/repos/SagerNet/sing-box/releases 2>/dev/null)
+    
+    VER_110=$(echo "$RELS" | grep -oE 'v1\.10\.[0-9]+' | head -n 1 | tr -d 'v')
+    [ -z "$VER_110" ] && VER_110="1.10.1"
+
+    VER_MID=$(echo "$RELS" | grep -oE 'v1\.1[34]\.[0-9]+' | head -n 1 | tr -d 'v')
+    [ -z "$VER_MID" ] && VER_MID="1.14.2"
+
+    echo "=========================================================="
+    echo "       📦 请选择部署的 Sing-box 核心版本 (流式直写防 OOM)  "
+    echo "=========================================================="
+    echo "  1. v${VER_110} (64M ~ 128M 容器首选，极度轻量约 28MB)"
+    echo "  2. v${VER_MID} (128M ~ 256M 容器首选，平衡稳定)"
+    echo "  3. v${VER_LATEST} (Latest 官方最新正式版，适合 256MB+ 或 KVM)"
+    echo "  4. 自定义输入版本号"
+    if [ -x "$BIN" ]; then
+        echo "  0. 保持当前已安装核心 ($("$BIN" version 2>/dev/null | head -n1))"
+    fi
+    echo "----------------------------------------------------------"
+    printf "请选择核心版本 [默认 1]: "
+    read c_choice
+    case "$c_choice" in
+        0)
+            if [ -x "$BIN" ]; then
+                echo "[*] 沿用现有已安装核心"
+                return 0
+            fi
+            VER="$VER_110"
+            ;;
+        2) VER="$VER_MID" ;;
+        3) VER="$VER_LATEST" ;;
+        4)
+            printf "请输入指定的官方版本号 (如 1.13.12): "
+            read custom_ver
+            VER="${custom_ver:-$VER_110}"
+            ;;
+        *) VER="$VER_110" ;;
+    esac
+    VER=$(echo "$VER" | sed 's/^v//' | tr -d ' \r\n')
+    
+    if [ -n "$(pidof sing-box)" ]; then
+        killall sing-box 2>/dev/null
+    fi
+    
+    ARCH=$(uname -m)
+    [ "$ARCH" = "aarch64" ] && A="arm64" || A="amd64"
+    
+    URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${A}.tar.gz"
+
+    echo "[*] 正在管道流式直写拉取 v${VER} 核心 (零硬盘落地防 OOM)..."
+    DL_OK=0
+    for MIRROR in "" "https://ghproxy.net/" "https://mirror.ghproxy.com/" "https://fastgh.js.org/"; do
+        if curl -sL --connect-timeout 8 -m 60 "${MIRROR}${URL}" 2>/dev/null | tar -xz -C /usr/bin/ --strip-components=1 "sing-box-${VER}-linux-${A}/sing-box" 2>/dev/null; then
+            DL_OK=1
+            chmod +x "$BIN"
+            echo "✅ 内核下载并解压成功！"
+            break
+        elif wget --no-check-certificate -qO- -T 10 "${MIRROR}${URL}" 2>/dev/null | tar -xz -C /usr/bin/ --strip-components=1 "sing-box-${VER}-linux-${A}/sing-box" 2>/dev/null; then
+            DL_OK=1
+            chmod +x "$BIN"
+            echo "✅ 内核下载并解压成功！"
+            break
+        fi
+    done
+    
+    if [ "$DL_OK" = "0" ] || ! "$BIN" version >/dev/null 2>&1; then
+        echo "[-] 核心拉取或执行校验失败，请检查网络。"
+        return 1
+    fi
+    
+    CORE_V=$("$BIN" version | head -n1)
+    echo "OK: $CORE_V"
+    return 0
+}
 
 get_cert() {
     D=$1
     echo "[*] 准备向 Let's Encrypt 申请真实证书..."
-    [ "$ID" = "debian" ] || [ "$ID" = "ubuntu" ] && apt-get update -y >/dev/null 2>&1
-    $CMD wget curl openssl socat git >/dev/null 2>&1
+    init_env
     
     if [ ! -f ~/.acme.sh/acme.sh ]; then
         curl -s https://get.acme.sh | sh -s email="admin@$D" >/dev/null 2>&1
@@ -62,10 +148,10 @@ get_cert() {
 }
 
 gen_self_cert() {
-    echo "[*] 正在生成本地自签证书 (免域名 / 免 80 端口)..."
+    echo "[*] 正在动态生成全新独享 ECC 自签证书 (内存占用 <5MB)..."
     mkdir -p "$DIR"
     if ! command -v openssl >/dev/null 2>&1; then
-        $CMD openssl >/dev/null 2>&1
+        init_env
     fi
     openssl ecparam -genkey -name prime256v1 -out "$DIR/key.pem" >/dev/null 2>&1
     openssl req -new -x509 -days 36500 -key "$DIR/key.pem" -out "$DIR/cert.pem" -subj "/CN=www.apple.com" >/dev/null 2>&1
@@ -221,6 +307,10 @@ EOF
       "listen": "::",
       "listen_port": $P_HY2,
       "users": [{"password": "$UUID"}],
+      "obfs": {
+        "type": "salamander",
+        "password": "$OBFS_PWD"
+      },
       "tls": {
         "enabled": true,
         "alpn": ["h3"],
@@ -316,6 +406,20 @@ do_install() {
     mkdir -p "$DIR"
     rm -f "$ENV" "$CFG"
 
+    if [ "$MODE" = "full" ] || [ "$MODE" = "combo" ] || [ ! -x "$BIN" ]; then
+        clear
+        if [ "$MODE" = "full" ]; then
+            echo "=========================================================="
+            echo "   📦 正在部署【正规全量包】(需真实域名+80端口)"
+            echo "=========================================================="
+        elif [ "$MODE" = "combo" ]; then
+            echo "=========================================================="
+            echo "   🦄 正在部署【免域全家桶】(免域名 / 自签证书)"
+            echo "=========================================================="
+        fi
+        pull_core || { echo "[-] 核心拉取未完成，终止安装"; printf "按回车返回..."; read d; return 1; }
+    fi
+
     if [ "$MODE" = "full" ]; then
         printf "[?] 是否立刻申请真实证书(需绑定域名)? (y/n): "
         read y
@@ -344,33 +448,6 @@ do_install() {
             ;;
     esac
 
-    if ! command -v sing-box >/dev/null 2>&1; then
-        echo "[*] 正在拉取 Sing-box v1.10.1 官方核心 (流式解压，防内存溢出)..."
-        $CMD wget curl tar gzip >/dev/null 2>&1
-        ARCH=$(uname -m)
-        [ "$ARCH" = "aarch64" ] && A="arm64" || A="amd64"
-        VER="1.10.1"
-        URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${A}.tar.gz"
-        DL_OK=0
-        for MIRROR in "" "https://ghproxy.net/" "https://mirror.ghproxy.com/" "https://fastgh.js.org/"; do
-            if curl -sL --connect-timeout 8 -m 60 "${MIRROR}${URL}" | tar -xz -C /usr/bin/ --strip-components=1 "sing-box-${VER}-linux-${A}/sing-box" 2>/dev/null; then
-                DL_OK=1
-                chmod +x /usr/bin/sing-box
-                echo "✅ 内核下载并解压成功！"
-                break
-            elif wget --no-check-certificate -qO- -T 10 "${MIRROR}${URL}" 2>/dev/null | tar -xz -C /usr/bin/ --strip-components=1 "sing-box-${VER}-linux-${A}/sing-box" 2>/dev/null; then
-                DL_OK=1
-                chmod +x /usr/bin/sing-box
-                echo "✅ 内核下载并解压成功！"
-                break
-            fi
-        done
-        if [ "$DL_OK" = "0" ] || ! /usr/bin/sing-box version >/dev/null 2>&1; then
-            echo "❌ 内核下载或解压失败！请检查网络后重试。"
-            exit 1
-        fi
-    fi
-
     printf "请输入起始端口 [默认 37841]: "
     read PORT
     PORT=${PORT:-37841}
@@ -386,8 +463,14 @@ do_install() {
     PK=$(echo "$KEYS" | awk '/PrivateKey/ {print $2}')
     PUB=$(echo "$KEYS" | awk '/PublicKey/ {print $2}')
     SID=$(sing-box generate rand 8 --hex 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | cut -c 1-8)
+    
+    # 彻底对齐通用密码：SS 密码直接绑定统一 UUID
     SS_M="chacha20-ietf-poly1305"
-    SS_P=$(sing-box generate rand 16 --hex 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | cut -c 1-16)
+    SS_P="$UUID"
+    
+    # 补齐 Hysteria 2 混淆密码 (salamander obfs)
+    OBFS_PWD=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | cut -c 1-16)
+    [ -z "$OBFS_PWD" ] && OBFS_PWD=$(sing-box generate rand 8 --hex 2>/dev/null)
     
     IP=$(wget -qO- -T 5 https://api.ipify.org 2>/dev/null || curl -s -m 5 https://api.ipify.org 2>/dev/null || echo "127.0.0.1")
     SNI="www.apple.com"
@@ -402,6 +485,7 @@ SID="$SID"
 UUID="$UUID"
 SS_M="$SS_M"
 SS_P="$SS_P"
+OBFS_PWD="$OBFS_PWD"
 REAL="$REAL"
 MODE="$MODE"
 P_SS=$P_SS
@@ -449,7 +533,7 @@ load_env() {
     L_AT="trojan://${UUID}@${URL_HOST}:${P_ANYTLS}?security=reality&sni=${SNI}&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#SingBox-Trojan"
     L_TC="tuic://${UUID}:${UUID}@${URL_HOST}:${P_TUIC}?sni=${C_SNI}&alpn=h3${SEC_TC}#SingBox-TUIC"
     L_NV="naive+https://${N_USER}:${UUID}@${URL_HOST}:${P_NAIVE}#SingBox-Naive"
-    L_HY="hysteria2://${UUID}@${URL_HOST}:${P_HY2}/?sni=${C_SNI}${SEC_HY}#SingBox-HY2"
+    L_HY="hysteria2://${UUID}@${URL_HOST}:${P_HY2}/?sni=${C_SNI}${SEC_HY}&obfs=salamander&obfs-password=${OBFS_PWD}#SingBox-HY2"
     return 0
 }
 
@@ -470,8 +554,8 @@ view_params() {
             ;;
     esac
     echo "----------------------------------------------------------"
-    echo "【密码凭证】 统一UUID : $UUID"
-    echo "             👉 SS 随机密码: $SS_P"
+    echo "【密码凭证】 统一凭据(UUID/SS密码) : $UUID"
+    echo "             HY2 混淆密码(obfs)     : $OBFS_PWD"
     echo "----------------------------------------------------------"
     case "$MODE" in
         full)
@@ -508,12 +592,15 @@ do_edit() {
     printf "👉 新伪装域名 [$SNI]: "
     read i_sni
     [ -n "$i_sni" ] && SNI="$i_sni"
-    printf "👉 新UUID [$UUID]: "
+    printf "👉 新统一UUID (同时生效于SS) [$UUID]: "
     read i_id
-    [ -n "$i_id" ] && UUID="$i_id"
-    printf "👉 修改 SS 密码 [$SS_P]: "
-    read i_ssp
-    [ -n "$i_ssp" ] && SS_P="$i_ssp"
+    if [ -n "$i_id" ]; then
+        UUID="$i_id"
+        SS_P="$i_id"
+    fi
+    printf "👉 修改 HY2 混淆密码 [$OBFS_PWD]: "
+    read i_obfs
+    [ -n "$i_obfs" ] && OBFS_PWD="$i_obfs"
     printf "👉 修改 Trojan 端口 [$P_ANYTLS]: "
     read i_at
     [ -n "$i_at" ] && P_ANYTLS=$i_at
@@ -547,6 +634,7 @@ SID="$SID"
 UUID="$UUID"
 SS_M="$SS_M"
 SS_P="$SS_P"
+OBFS_PWD="$OBFS_PWD"
 REAL="$REAL"
 MODE="$MODE"
 P_SS=$P_SS
@@ -565,20 +653,20 @@ ENV_EOF
 while true; do
     clear
     echo "=========================================================="
-    echo "   🚀 Sing-box 面板 v4.2 Pro (全平台兼容 / 极限生存版)    "
+    echo "   🚀 Sing-box 面板 v4.4 Pro (全平台兼容 / 极限生存版)    "
     echo "=========================================================="
     echo "  1. 📦 部署【正规全量包】(6大顶级协议，需真实域名+80端口)"
     echo "  2. 🦄 部署【免域全家桶】(包含 VLESS+SS+Trojan+HY2+TUIC)"
     echo "  3. 🍃 部署【精简包】(3大Reality大件，完全免域名)"
-    echo "  4. ⚡ 部署【HY2 独立包】(自签证书，免域名/免80端口)"
+    echo "  4. ⚡ 部署【HY2 独立包】(自签证书+Salamander混淆)"
     echo "  5. 🚄 部署【TUIC 独立包】(自签证书，免域名/免80端口)"
     echo "  6. 📝 查看运行参数明细"
     echo "  7. 🔗 导出快捷导入链接 (全部节点明文)"
-    echo "  8. ⚙️ 修改 端口/UUID/密码/域名 (支持热修补)"
+    echo "  8. ⚙️ 修改 端口/UUID/混淆/域名 (支持热修补)"
     echo "  9. 🔄 手动重启并检查核心服务"
     echo "  0. 🚪 退出面板"
     echo "=========================================================="
-    printf "请输入选项 [0-9]: "
+    printf "请选择 [0-9]: "
     read choice
     case "$choice" in
         1) do_install "full" ;;
