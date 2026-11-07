@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==========================================================
-# Sing-box 面板 v4.4 Pro (全平台兼容 / 极限生存终极版)
+# Sing-box 面板 v4.5 Pro (配置智能继承 / 双引擎常驻生存版)
 # Author: rocky-yam-reburial
 # Repo: Sing-box-Universal-Survivor
 # ==========================================================
@@ -14,9 +14,10 @@ DIR="/etc/sing-box"
 CFG="$DIR/config.json"
 ENV="$DIR/node_info.env"
 BIN="/usr/bin/sing-box"
+LOG="/var/log/sing-box.log"
 
 init_env() {
-    mkdir -p "$DIR"
+    mkdir -p "$DIR" /var/log
     if [ -f /etc/os-release ]; then
         . /etc/os-release
     fi
@@ -25,11 +26,11 @@ init_env() {
             export DEBIAN_FRONTEND=noninteractive
             CMD="apt-get install -y --no-install-recommends"
             apt-get update -y >/dev/null 2>&1
-            $CMD wget curl openssl socat git libc6 >/dev/null 2>&1
+            $CMD wget curl openssl socat git procps libc6 >/dev/null 2>&1
             ;;
         centos|rhel|almalinux|rocky|fedora|amzn)
             CMD="yum install -y"
-            $CMD wget curl openssl socat git tar gzip >/dev/null 2>&1
+            $CMD wget curl openssl socat git procps-ng tar gzip >/dev/null 2>&1
             ;;
         *)
             CMD="apk add --no-cache"
@@ -166,15 +167,10 @@ gen_json() {
     add_naive=0
     case "$MODE" in
         full)
-            add_basic=1
-            add_tuic=1
-            add_hy2=1
-            add_naive=1
+            add_basic=1; add_tuic=1; add_hy2=1; add_naive=1
             ;;
         combo)
-            add_basic=1
-            add_tuic=1
-            add_hy2=1
+            add_basic=1; add_tuic=1; add_hy2=1
             ;;
         lite)
             add_basic=1
@@ -189,7 +185,10 @@ gen_json() {
 
     cat << 'EOF' > "$CFG"
 {
-  "log": {"level": "fatal"},
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
   "inbounds": [
 EOF
 
@@ -334,66 +333,155 @@ EOF
 EOF
 }
 
-setup_keeper() {
-    echo "[*] 正在为节点注入 Keeper 守护 (智能适配 Systemd/OpenRC/LXC)..."
+setup_daemon() {
+    # 1. Systemd 宿主或 KVM 架构守护
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        cat << 'SERVICE_EOF' > /etc/systemd/system/sing-box.service
+[Unit]
+Description=Sing-box Service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+
+[Service]
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+ExecStart=/usr/bin/sing-box run -c /etc/sing-box/config.json
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
+Environment="GOMEMLIMIT=30MiB"
+StandardOutput=append:/var/log/sing-box.log
+StandardError=append:/var/log/sing-box.log
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+        systemctl daemon-reload >/dev/null 2>&1
+        systemctl enable sing-box >/dev/null 2>&1
+        INIT_MODE="systemd"
+
+    # 2. Alpine Linux OpenRC 原生常驻守护
+    elif command -v rc-service >/dev/null 2>&1 && [ -d /etc/init.d ]; then
+        cat << 'OPENRC_EOF' > /etc/init.d/sing-box
+#!/sbin/openrc-run
+description="Sing-box Service"
+command="/usr/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+command_background=true
+pidfile="/run/sing-box.pid"
+output_log="/var/log/sing-box.log"
+error_log="/var/log/sing-box.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    export GOMEMLIMIT=30MiB
+    ulimit -n 65535
+}
+OPENRC_EOF
+        chmod +x /etc/init.d/sing-box
+        rc-update add sing-box default >/dev/null 2>&1
+        INIT_MODE="openrc"
+
+    # 3. 极简环境独立守护
+    else
+        INIT_MODE="direct"
+    fi
+
+    # 配置 Keeper 内存熔断监控 Watchdog
     cat << 'KEEPER_EOF' > /root/keeper.sh
 #!/bin/sh
 ulimit -n 65535 2>/dev/null
 export GOMEMLIMIT=30MiB
+export GOGC=25
 
 if ! pgrep -f "sing-box run" >/dev/null; then
-    if command -v systemctl >/dev/null 2>&1 && systemctl --no-pager >/dev/null 2>&1; then
-        systemctl reset-failed sing-box 2>/dev/null
-        systemctl restart sing-box 2>/dev/null
-    elif command -v rc-service >/dev/null 2>&1; then 
-        rc-service sing-box restart 2>/dev/null
-    else 
-        nohup /usr/bin/sing-box run -c /etc/sing-box/config.json </dev/null >/dev/null 2>&1 & 
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl restart sing-box >/dev/null 2>&1
+    elif command -v rc-service >/dev/null 2>&1 && [ -x /etc/init.d/sing-box ]; then
+        rc-service sing-box restart >/dev/null 2>&1
+    else
+        nohup /usr/bin/sing-box run -c /etc/sing-box/config.json </dev/null >>/var/log/sing-box.log 2>&1 &
+    fi
+    exit 0
+fi
+
+PID=$(pidof sing-box)
+[ -z "$PID" ] && PID=$(pgrep -f "sing-box run" | head -n1)
+if [ -n "$PID" ]; then
+    PAGES=$(awk '{print $2}' "/proc/$PID/statm" 2>/dev/null)
+    if [ -n "$PAGES" ] && [ "$PAGES" -gt 8000 ]; then
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+            systemctl restart sing-box >/dev/null 2>&1
+        elif command -v rc-service >/dev/null 2>&1 && [ -x /etc/init.d/sing-box ]; then
+            rc-service sing-box restart >/dev/null 2>&1
+        else
+            kill -9 $PID 2>/dev/null
+            sleep 1
+            nohup /usr/bin/sing-box run -c /etc/sing-box/config.json </dev/null >>/var/log/sing-box.log 2>&1 &
+        fi
     fi
 fi
 KEEPER_EOF
     chmod +x /root/keeper.sh
 
-    crontab -l > /tmp/mycron 2>/dev/null
-    sed -i '/keeper.sh/d' /tmp/mycron 2>/dev/null
-    sed -i '/pkill -f sing-box/d' /tmp/mycron 2>/dev/null
-    echo "@reboot /bin/sh /root/keeper.sh >/dev/null 2>&1" >> /tmp/mycron
-    echo "* * * * * /bin/sh /root/keeper.sh >/dev/null 2>&1" >> /tmp/mycron
-    echo "0 4 * * * pkill -f sing-box >/dev/null 2>&1" >> /tmp/mycron
-    crontab /tmp/mycron 2>/dev/null
-    rm -f /tmp/mycron
+    crontab -l 2>/dev/null | grep -v "keeper.sh" > /tmp/cron
+    echo "* * * * * /root/keeper.sh >/dev/null 2>&1" >> /tmp/cron
+    crontab /tmp/cron
+    rm -f /tmp/cron
 
-    if command -v systemctl >/dev/null 2>&1; then
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         systemctl enable cron >/dev/null 2>&1 || systemctl enable crond >/dev/null 2>&1
         systemctl start cron >/dev/null 2>&1 || systemctl start crond >/dev/null 2>&1
     elif command -v rc-service >/dev/null 2>&1; then
         rc-update add crond default >/dev/null 2>&1
         rc-service crond start >/dev/null 2>&1
-    else
-        if ! pgrep -f "cron" >/dev/null; then
-            [ -x /usr/sbin/crond ] && /usr/sbin/crond
-            [ -x /usr/sbin/cron ] && /usr/sbin/cron
-        fi
     fi
 }
 
 restart_svc() {
-    echo "[*] 应用配置并重启服务..."
+    echo "[*] 正在校验配置并重启服务..."
     chmod -R 755 "$DIR"
     [ -f "$DIR/key.pem" ] && chmod 644 "$DIR"/*.pem
     chmod 644 "$CFG"
-    killall sing-box >/dev/null 2>&1
-    sleep 1
 
-    nohup /usr/bin/sing-box run -c "$CFG" </dev/null >/dev/null 2>&1 &
+    # 启动前强制做语法与配置校验
+    if ! "$BIN" check -c "$CFG" >/tmp/sb_check.log 2>&1; then
+        echo "❌ 配置文件校验未通过！内核返回具体错误如下："
+        cat /tmp/sb_check.log
+        printf "按回车键返回菜单..."
+        read d
+        return 1
+    fi
+
+    setup_daemon
+
+    if [ "$INIT_MODE" = "systemd" ]; then
+        systemctl restart sing-box >/dev/null 2>&1
+    elif [ "$INIT_MODE" = "openrc" ]; then
+        rc-service sing-box restart >/dev/null 2>&1
+    else
+        killall sing-box 2>/dev/null
+        sleep 1
+        export GOMEMLIMIT=30MiB
+        nohup "$BIN" run -c "$CFG" </dev/null >>"$LOG" 2>&1 &
+    fi
+
     sleep 2
     
-    setup_keeper
-    
-    if pgrep -f "sing-box run" >/dev/null; then
-        echo "✅ 服务已成功运行！全平台自动化守护进程已接管。"
+    PID=$(pidof sing-box)
+    [ -z "$PID" ] && PID=$(pgrep -f "sing-box run" | head -n1)
+
+    if [ -n "$PID" ]; then
+        echo "✅ 服务已成功运行！PID: $PID (已接入系统级常驻服务: $INIT_MODE)"
     else
-        echo "❌ 启动失败！请排查配置或系统环境。"
+        echo "❌ 启动失败！服务未能成功驻留后台。内核日志如下："
+        echo "----------------------------------------------------------"
+        [ -f "$LOG" ] && tail -n 15 "$LOG"
+        echo "----------------------------------------------------------"
     fi
     printf "按回车键返回菜单..."
     read d
@@ -402,10 +490,9 @@ restart_svc() {
 do_install() {
     MODE=$1
     REAL="www.apple.com"
-    killall sing-box >/dev/null 2>&1
-    mkdir -p "$DIR"
-    rm -f "$ENV" "$CFG"
+    init_env
 
+    # 1. 核心版本选择与拉取
     if [ "$MODE" = "full" ] || [ "$MODE" = "combo" ] || [ ! -x "$BIN" ]; then
         clear
         if [ "$MODE" = "full" ]; then
@@ -420,61 +507,111 @@ do_install() {
         pull_core || { echo "[-] 核心拉取未完成，终止安装"; printf "按回车返回..."; read d; return 1; }
     fi
 
-    if [ "$MODE" = "full" ]; then
-        printf "[?] 是否立刻申请真实证书(需绑定域名)? (y/n): "
-        read y
-        if [ "$y" = "y" ]; then
-            printf "请输入你的域名: "
-            read d
-            if get_cert "$d"; then
-                REAL="$d"
+    # 2. 关键检查：先读取并探测本地配置
+    USE_EXISTING=0
+    if [ -f "$ENV" ]; then
+        . "$ENV" 2>/dev/null
+        if [ -n "$UUID" ] && [ -n "$P_SS" ] && [ -n "$PK" ] && [ -n "$PUB" ]; then
+            echo ""
+            echo "=========================================================="
+            echo "  🔍 检测到本地已存在历史配置凭据："
+            echo "  - 统一凭据(UUID) : $UUID"
+            echo "  - 起始端口       : $P_SS"
+            echo "  - 伪装域名(SNI)  : $SNI"
+            echo "  - Reality 公钥   : $PUB"
+            [ -n "$OBFS_PWD" ] && echo "  - HY2 混淆密码   : $OBFS_PWD"
+            echo "=========================================================="
+            printf "[?] 检测到历史配置，是否继承已有参数直接安装？(y/n) [默认 y]: "
+            read inherit_choice
+            inherit_choice=${inherit_choice:-y}
+            if [ "$inherit_choice" = "y" ] || [ "$inherit_choice" = "Y" ]; then
+                echo "✅ 已确认继承本地配置参数，客户端参数保持不变！"
+                USE_EXISTING=1
             else
-                echo "[-] 证书失败，降级为免域全家桶"
+                echo "[*] 用户选择放弃旧配置，正在生成全新随机凭据..."
+            fi
+        else
+            echo ""
+            echo "⚠️ 侦测到本地历史配置已损坏或参数不全，将自动生成全新参数..."
+        fi
+    else
+        echo ""
+        echo "ℹ️ 未侦测到本地历史配置，将自动生成全新参数..."
+    fi
+
+    # 3. 证书处理
+    if [ "$MODE" = "full" ]; then
+        if [ "$USE_EXISTING" = "1" ] && [ "$REAL" != "www.apple.com" ] && [ -f "$DIR/cert.pem" ]; then
+            echo "[*] 沿用已有证书域名: $REAL"
+        else
+            printf "[?] 是否立刻申请真实证书(需绑定域名)? (y/n): "
+            read y
+            if [ "$y" = "y" ] || [ "$y" = "Y" ]; then
+                printf "请输入你的域名: "
+                read d
+                if get_cert "$d"; then
+                    REAL="$d"
+                else
+                    echo "[-] 证书失败，降级为免域全家桶"
+                    MODE="combo"
+                    printf "按回车继续..."
+                    read d
+                fi
+            else
+                echo "[-] 自动降级为免域全家桶"
                 MODE="combo"
                 printf "按回车继续..."
                 read d
             fi
-        else
-            echo "[-] 自动降级为免域全家桶"
-            MODE="combo"
-            printf "按回车继续..."
-            read d
         fi
     fi
     
     case "$MODE" in
         hy2|tuic|combo)
-            gen_self_cert
+            if [ ! -f "$DIR/cert.pem" ] || [ ! -f "$DIR/key.pem" ]; then
+                gen_self_cert
+            fi
             ;;
     esac
 
-    printf "请输入起始端口 [默认 37841]: "
-    read PORT
-    PORT=${PORT:-37841}
-    P_SS=$PORT
-    P_VLESS=$((PORT+1))
-    P_ANYTLS=$((PORT+2))
-    P_TUIC=$((PORT+3))
-    P_NAIVE=$((PORT+4))
-    P_HY2=$((PORT+5))
-    
-    UUID=$(sing-box generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)
-    KEYS=$(sing-box generate reality-keypair 2>/dev/null)
-    PK=$(echo "$KEYS" | awk '/PrivateKey/ {print $2}')
-    PUB=$(echo "$KEYS" | awk '/PublicKey/ {print $2}')
-    SID=$(sing-box generate rand 8 --hex 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | cut -c 1-8)
-    
-    # 彻底对齐通用密码：SS 密码直接绑定统一 UUID
-    SS_M="chacha20-ietf-poly1305"
-    SS_P="$UUID"
-    
-    # 补齐 Hysteria 2 混淆密码 (salamander obfs)
-    OBFS_PWD=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | cut -c 1-16)
-    [ -z "$OBFS_PWD" ] && OBFS_PWD=$(sing-box generate rand 8 --hex 2>/dev/null)
-    
-    IP=$(wget -qO- -T 5 https://api.ipify.org 2>/dev/null || curl -s -m 5 https://api.ipify.org 2>/dev/null || echo "127.0.0.1")
-    SNI="www.apple.com"
-    N_USER="nv$SID"
+    # 4. 生成新参数或继承已有参数
+    if [ "$USE_EXISTING" = "0" ]; then
+        printf "请输入起始端口 [默认 37841]: "
+        read PORT
+        PORT=${PORT:-37841}
+        P_SS=$PORT
+        P_VLESS=$((PORT+1))
+        P_ANYTLS=$((PORT+2))
+        P_TUIC=$((PORT+3))
+        P_NAIVE=$((PORT+4))
+        P_HY2=$((PORT+5))
+        
+        UUID=$(sing-box generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)
+        KEYS=$(sing-box generate reality-keypair 2>/dev/null)
+        PK=$(echo "$KEYS" | awk '/PrivateKey/ {print $2}')
+        PUB=$(echo "$KEYS" | awk '/PublicKey/ {print $2}')
+        SID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | cut -c 1-16)
+        [ -z "$SID" ] && SID=$(sing-box generate rand 8 --hex 2>/dev/null)
+        
+        SS_M="chacha20-ietf-poly1305"
+        SS_P="$UUID"
+        
+        OBFS_PWD=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | cut -c 1-16)
+        [ -z "$OBFS_PWD" ] && OBFS_PWD=$(sing-box generate rand 8 --hex 2>/dev/null)
+        
+        IP=$(wget -qO- -T 5 https://api.ipify.org 2>/dev/null || curl -s -m 5 https://api.ipify.org 2>/dev/null || echo "127.0.0.1")
+        SNI="www.apple.com"
+        N_USER="nv$SID"
+    else
+        # 继承模式下进行必要容灾补齐
+        [ -z "$OBFS_PWD" ] && OBFS_PWD=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | cut -c 1-16)
+        [ -z "$OBFS_PWD" ] && OBFS_PWD=$(sing-box generate rand 8 --hex 2>/dev/null)
+        SS_P="$UUID"
+        
+        # 刷新公网 IP 避免漂移
+        CURR_IP=$(wget -qO- -T 5 https://api.ipify.org 2>/dev/null || curl -s -m 5 https://api.ipify.org 2>/dev/null)
+        [ -n "$CURR_IP" ] && IP="$CURR_IP"
+    fi
 
     cat << ENV_EOF > "$ENV"
 IP="$IP"
@@ -653,7 +790,7 @@ ENV_EOF
 while true; do
     clear
     echo "=========================================================="
-    echo "   🚀 Sing-box 面板 v4.4 Pro (全平台兼容 / 极限生存版)    "
+    echo "   🚀 Sing-box 面板 v4.5 Pro (全平台兼容 / 极限生存版)    "
     echo "=========================================================="
     echo "  1. 📦 部署【正规全量包】(6大顶级协议，需真实域名+80端口)"
     echo "  2. 🦄 部署【免域全家桶】(包含 VLESS+SS+Trojan+HY2+TUIC)"
